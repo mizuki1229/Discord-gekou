@@ -1,195 +1,186 @@
-// ===== 必須 =====
 import "dotenv/config";
+import fs from "fs";
 import {
   Client,
   GatewayIntentBits,
-  Partials,
-  REST,
-  Routes,
-  SlashCommandBuilder,
   PermissionsBitField,
   ActionRowBuilder,
   ButtonBuilder,
   ButtonStyle,
-  EmbedBuilder,
+  EmbedBuilder
 } from "discord.js";
+import { joinVoiceChannel, getVoiceConnection } from "@discordjs/voice";
 
-// ===== Bot設定 =====
+/* ===== 環境変数 ===== */
+const { DISCORD_TOKEN, CLIENT_ID } = process.env;
+if (!DISCORD_TOKEN || !CLIENT_ID) {
+  console.error("❌ .env に DISCORD_TOKEN / CLIENT_ID が必要");
+  process.exit(1);
+}
+
+/* ===== 永続データ ===== */
+const DATA_PATH = "./data/guildConfig.json";
+if (!fs.existsSync("./data")) fs.mkdirSync("./data");
+if (!fs.existsSync(DATA_PATH)) fs.writeFileSync(DATA_PATH, "{}");
+
+const loadData = () => JSON.parse(fs.readFileSync(DATA_PATH, "utf8"));
+const saveData = data => fs.writeFileSync(DATA_PATH, JSON.stringify(data, null, 2));
+
+let guildData = loadData();
+
+/* ===== Client ===== */
 const client = new Client({
   intents: [
     GatewayIntentBits.Guilds,
-    GatewayIntentBits.GuildMembers,
-    GatewayIntentBits.GuildVoiceStates,
     GatewayIntentBits.GuildMessages,
     GatewayIntentBits.MessageContent,
-    GatewayIntentBits.DirectMessages,
-  ],
-  partials: [Partials.Channel],
+    GatewayIntentBits.GuildVoiceStates,
+    GatewayIntentBits.GuildMembers,
+    GatewayIntentBits.DirectMessages
+  ]
 });
 
-// ===== スラッシュコマンド定義 =====
-const commands = [
-  new SlashCommandBuilder()
-    .setName("join")
-    .setDescription("BOTをボイスチャンネルに参加させる"),
+/* ===== 起動 ===== */
+client.once("clientReady", () => {
+  console.log(`🤖 Logged in as ${client.user.tag}`);
+});
 
-  new SlashCommandBuilder()
-    .setName("leave")
-    .setDescription("BOTをボイスチャンネルから退出させる"),
-
-  new SlashCommandBuilder()
-    .setName("ninnsyou")
-    .setDescription("認証ボタンを設置")
-    .addRoleOption(opt =>
-      opt.setName("role")
-        .setDescription("付与するロール")
-        .setRequired(true)
-    )
-    .addStringOption(opt =>
-      opt.setName("comment")
-        .setDescription("埋め込みに表示する文章")
-        .setRequired(true)
-    ),
-
-  new SlashCommandBuilder()
-    .setName("ban")
-    .setDescription("ユーザーをBAN")
-    .addUserOption(opt =>
-      opt.setName("user")
-        .setDescription("BANするユーザー")
-        .setRequired(true)
-    ),
-
-  new SlashCommandBuilder()
-    .setName("setadmin")
-    .setDescription("BANを実行できるユーザーを追加")
-    .addUserOption(opt =>
-      opt.setName("user")
-        .setDescription("許可するユーザー")
-        .setRequired(true)
-    ),
-].map(c => c.toJSON());
-
-// ===== コマンド登録 =====
-const rest = new REST({ version: "10" }).setToken(process.env.DISCORD_TOKEN);
-
-(async () => {
-  try {
-    console.log("⏳ コマンド登録中...");
-    await rest.put(
-      Routes.applicationCommands(process.env.CLIENT_ID),
-      { body: commands }
-    );
-    console.log("✅ コマンド登録完了");
-  } catch (err) {
-    console.error("❌ コマンド登録失敗", err);
+/* ===== VC自動退出 ===== */
+client.on("voiceStateUpdate", (_, newState) => {
+  const conn = getVoiceConnection(newState.guild.id);
+  if (!conn) return;
+  const channel = newState.guild.channels.cache.get(conn.joinConfig.channelId);
+  if (channel && channel.members.filter(m => !m.user.bot).size === 0) {
+    conn.destroy();
   }
-})();
-
-// ===== 簡易DB =====
-const banAdmins = new Set();
-
-// ===== 起動 =====
-client.once("ready", () => {
-  console.log(`🤖 ログイン完了: ${client.user.tag}`);
 });
 
-// ===== インタラクション処理 =====
+/* ===== メッセージ監視（招待URL） ===== */
+client.on("messageCreate", async message => {
+  if (!message.guild || message.author.bot) return;
+  if (!message.content.match(/discord\.gg|discord\.com\/invite/)) return;
+
+  const gid = message.guild.id;
+  const data = guildData[gid];
+  if (!data?.inviteRole) return;
+
+  if (message.member.roles.cache.has(data.inviteRole)) return;
+
+  await message.delete().catch(() => {});
+  const count = (data.warns?.[message.author.id] ?? 0) + 1;
+  data.warns ??= {};
+  data.warns[message.author.id] = count;
+
+  saveData(guildData);
+
+  if (count >= 3) {
+    try {
+      await message.member.timeout(24 * 60 * 60 * 1000, "招待URL違反");
+      for (const adminId of data.adminUsers ?? []) {
+        client.users.fetch(adminId)
+          .then(u => u.send(`🚨 ${message.author.tag} をタイムアウトしました`))
+          .catch(() => {});
+      }
+    } catch {}
+  }
+});
+
+/* ===== Interaction ===== */
 client.on("interactionCreate", async interaction => {
   try {
     if (interaction.isChatInputCommand()) {
-      const { commandName } = interaction;
+      const gid = interaction.guild.id;
+      guildData[gid] ??= { warns: {}, adminUsers: [] };
 
-      // ---- join ----
-      if (commandName === "join") {
+      /* /join */
+      if (interaction.commandName === "join") {
         const vc = interaction.member.voice.channel;
-        if (!vc) {
-          return interaction.reply({ content: "VCに参加してから使ってください", ephemeral: true });
-        }
-        await vc.join();
-        return interaction.reply({ content: "VCに参加しました", ephemeral: true });
+        if (!vc) return interaction.reply({ content: "VCに入ってね", flags: 64 });
+        joinVoiceChannel({
+          channelId: vc.id,
+          guildId: gid,
+          adapterCreator: interaction.guild.voiceAdapterCreator
+        });
+        return interaction.reply("参加したよ");
       }
 
-      // ---- leave ----
-      if (commandName === "leave") {
-        const vc = interaction.guild.members.me.voice.channel;
-        if (!vc) {
-          return interaction.reply({ content: "VCに参加していません", ephemeral: true });
-        }
-        await vc.leave();
-        return interaction.reply({ content: "VCから退出しました", ephemeral: true });
+      /* /leave */
+      if (interaction.commandName === "leave") {
+        const conn = getVoiceConnection(gid);
+        if (conn) conn.destroy();
+        return interaction.reply("退出したよ");
       }
 
-      // ---- ninnsyou ----
-      if (commandName === "ninnsyou") {
+      /* /setadmin */
+      if (interaction.commandName === "setadmin") {
+        if (!interaction.member.permissions.has(PermissionsBitField.Flags.Administrator))
+          return interaction.reply({ content: "権限なし", flags: 64 });
+
+        const user = interaction.options.getUser("user");
+        guildData[gid].adminUsers.push(user.id);
+        saveData(guildData);
+        return interaction.reply(`✅ ${user.tag} を管理者に設定`);
+      }
+
+      /* /ban */
+      if (interaction.commandName === "ban") {
+        const target = interaction.options.getUser("user");
+        const allowed =
+          interaction.member.permissions.has(PermissionsBitField.Flags.Administrator) ||
+          guildData[gid].adminUsers.includes(interaction.user.id);
+
+        if (!allowed)
+          return interaction.reply({ content: "権限なし", flags: 64 });
+
+        const row = new ActionRowBuilder().addComponents(
+          new ButtonBuilder().setCustomId("ban_yes").setLabel("⭕").setStyle(ButtonStyle.Danger),
+          new ButtonBuilder().setCustomId("ban_no").setLabel("❌").setStyle(ButtonStyle.Secondary)
+        );
+
+        await interaction.reply({ content: "DMを確認してください", flags: 64 });
+        const dm = await interaction.user.send({
+          content: `${target.tag} をBANしますか？`,
+          components: [row]
+        });
+
+        const collector = dm.createMessageComponentCollector({ time: 30000, max: 1 });
+        collector.on("collect", async i => {
+          if (i.customId === "ban_yes") {
+            await interaction.guild.members.ban(target.id);
+            await i.reply("BANしました");
+          } else {
+            await i.reply("キャンセルしました");
+          }
+        });
+      }
+
+      /* /ninnsyou */
+      if (interaction.commandName === "ninnsyou") {
         const role = interaction.options.getRole("role");
-        const comment = interaction.options.getString("comment");
-
         const embed = new EmbedBuilder()
           .setTitle("認証")
-          .setDescription(comment)
-          .setColor(0x00ffcc);
+          .setDescription("下のボタンを押して認証してください");
 
-        const button = new ButtonBuilder()
-          .setCustomId(`auth_${role.id}`)
-          .setLabel("認証する")
-          .setStyle(ButtonStyle.Success);
-
-        const row = new ActionRowBuilder().addComponents(button);
+        const row = new ActionRowBuilder().addComponents(
+          new ButtonBuilder().setCustomId(`verify_${role.id}`).setLabel("認証").setStyle(ButtonStyle.Success)
+        );
 
         await interaction.channel.send({ embeds: [embed], components: [row] });
-        return interaction.reply({ content: "認証ボタンを設置しました", ephemeral: true });
-      }
-
-      // ---- ban ----
-      if (commandName === "ban") {
-        const target = interaction.options.getUser("user");
-
-        const isAdmin =
-          interaction.member.permissions.has(PermissionsBitField.Flags.Administrator) ||
-          banAdmins.has(interaction.user.id);
-
-        if (!isAdmin) {
-          return interaction.reply({ content: "権限がありません", ephemeral: true });
-        }
-
-        await interaction.guild.members.ban(target.id);
-        return interaction.reply({ content: `${target.tag} をBANしました`, ephemeral: true });
-      }
-
-      // ---- setadmin ----
-      if (commandName === "setadmin") {
-        if (!interaction.member.permissions.has(PermissionsBitField.Flags.Administrator)) {
-          return interaction.reply({ content: "管理者のみ使用可能", ephemeral: true });
-        }
-        const user = interaction.options.getUser("user");
-        banAdmins.add(user.id);
-        return interaction.reply({ content: `${user.tag} をBAN管理者に設定しました`, ephemeral: true });
+        await interaction.reply({ content: "設置しました", flags: 64 });
       }
     }
 
-    // ---- ボタン処理 ----
     if (interaction.isButton()) {
-      const roleId = interaction.customId.replace("auth_", "");
-      const role = interaction.guild.roles.cache.get(roleId);
-      if (!role) {
-        return interaction.reply({ content: "ロールが存在しません", ephemeral: true });
+      if (interaction.customId.startsWith("verify_")) {
+        const roleId = interaction.customId.split("_")[1];
+        await interaction.member.roles.add(roleId);
+        await interaction.reply({ content: "認証済みです", flags: 64 });
       }
-
-      if (interaction.member.roles.cache.has(roleId)) {
-        return interaction.reply({ content: "すでに認証済みです", ephemeral: true });
-      }
-
-      await interaction.member.roles.add(role);
-      return interaction.reply({ content: "認証完了しました", ephemeral: true });
     }
-  } catch (err) {
-    console.error("⚠️ エラー", err);
-    if (!interaction.replied) {
-      interaction.reply({ content: "エラーが発生しました", ephemeral: true }).catch(() => {});
-    }
+  } catch (e) {
+    console.error("❌ Interaction Error", e);
   }
 });
 
-// ===== ログイン =====
-client.login(process.env.DISCORD_TOKEN);
+/* ===== ログイン ===== */
+client.login(DISCORD_TOKEN);
